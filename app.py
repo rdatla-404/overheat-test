@@ -218,6 +218,20 @@ with tab_one:
         shown_years = st.session_state.get("years", 2)
         shown = data[data.index >= data.index[-1] - pd.Timedelta(days=365 * shown_years)]
 
+        st.subheader(f"{ticker} summary")
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("Price", f"${sbd.get_current_price(data):,.2f}")
+        m2.metric("Total return (period)", f"{sbd.get_total_return(shown):+.1f}%")
+        m3.metric("Volatility (ann.)", f"{sbd.get_volatility(data):.1f}%")
+        m4.metric("Max drawdown", f"{sbd.get_max_drawdown(shown):.1f}%")
+        m5.metric("RSI (14d)", f"{float(sbd.get_rsi(data).iloc[-1]):.1f}")
+        ratio = sbd.get_price_to_200ma_ratio(data)
+        m6.metric("Price / 200MA", f"{float(ratio.iloc[-1]):.2f}x" if ratio is not None else "N/A")
+
+        st.subheader("Price & RSI chart")
+        show_figure(sbd.plot_stock_detail(ticker, data, show=False, save=False,
+                                          view_start=shown.index[0]))
+
         result = sbd.run_bubble_analysis(ticker, data)
 
         if result["bubble_score"] is None:
@@ -284,19 +298,7 @@ with tab_one:
             st.caption("General risk habits, not trade instructions and not tested for profit. "
                        "Not financial advice.")
 
-        st.subheader(f"{ticker} summary")
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("Price", f"${sbd.get_current_price(data):,.2f}")
-        m2.metric("Total return (period)", f"{sbd.get_total_return(shown):+.1f}%")
-        m3.metric("Volatility (ann.)", f"{sbd.get_volatility(data):.1f}%")
-        m4.metric("Max drawdown", f"{sbd.get_max_drawdown(shown):.1f}%")
-        m5.metric("RSI (14d)", f"{float(sbd.get_rsi(data).iloc[-1]):.1f}")
-        ratio = sbd.get_price_to_200ma_ratio(data)
-        m6.metric("Price / 200MA", f"{float(ratio.iloc[-1]):.2f}x" if ratio is not None else "N/A")
 
-        st.subheader("Price & RSI chart")
-        show_figure(sbd.plot_stock_detail(ticker, data, show=False, save=False,
-                                          view_start=shown.index[0]))
     elif not analyze_clicked:
         st.info("Enter a ticker and click Analyze to get started.")
 
