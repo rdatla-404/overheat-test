@@ -1061,7 +1061,7 @@ def print_strategies(ticker, bubble_score, strategies):
 # SECTION 6: CHARTING
 # -------------------------------------------------------------
 
-def plot_stock_detail(ticker, data, show=True, save=True):
+def plot_stock_detail(ticker, data, show=True, save=True, view_start=None):
     """
     Produce a two-panel chart for one stock:
         Top panel    : Closing price with 50-day and 200-day moving averages.
@@ -1077,6 +1077,9 @@ def plot_stock_detail(ticker, data, show=True, save=True):
         data   : DataFrame -- Stock price data
         show   : bool      -- Call plt.show() (default True)
         save   : bool      -- Save a .png to disk (default True)
+        view_start : date  -- If given, only show dates from here on. The moving
+                              averages and RSI are still computed on ALL of `data`,
+                              so the lines are complete from the left edge.
 
     Returns:
         matplotlib.figure.Figure
@@ -1142,6 +1145,18 @@ def plot_stock_detail(ticker, data, show=True, save=True):
     ax_rsi.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
     ax_rsi.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
     plt.setp(ax_rsi.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+    if view_start is not None:
+        vs = pd.Timestamp(view_start)
+        if prices.index.tz is not None and vs.tzinfo is None:
+            vs = vs.tz_localize(prices.index.tz)
+        ax_price.set_xlim(vs, prices.index[-1] + pd.Timedelta(days=3))
+        vis = prices[prices.index >= vs]
+        cols = [vis] + [m[m.index >= vs].dropna() for m in (ma_50, ma_200)]
+        lo = min(float(c.min()) for c in cols if len(c))
+        hi = max(float(c.max()) for c in cols if len(c))
+        pad = (hi - lo) * 0.05 or 1.0
+        ax_price.set_ylim(lo - pad, hi + pad)
 
     filename = f'{ticker}_analysis.png'
     plt.tight_layout()
