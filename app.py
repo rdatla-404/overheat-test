@@ -295,7 +295,8 @@ with tab_one:
         m6.metric("Price / 200MA", f"{float(ratio.iloc[-1]):.2f}x" if ratio is not None else "N/A")
 
         st.subheader("Price & RSI chart")
-        show_figure(sbd.plot_stock_detail(ticker, shown, show=False, save=False))
+        show_figure(sbd.plot_stock_detail(ticker, data, show=False, save=False,
+                                          view_start=shown.index[0]))
     elif not analyze_clicked:
         st.info("Enter a ticker and click Analyze to get started.")
 
