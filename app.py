@@ -228,9 +228,10 @@ with tab_one:
         ratio = sbd.get_price_to_200ma_ratio(data)
         m6.metric("Price / 200MA", f"{float(ratio.iloc[-1]):.2f}x" if ratio is not None else "N/A")
 
-        st.subheader("Price & RSI chart")
-        show_figure(sbd.plot_stock_detail(ticker, data, show=False, save=False,
-                                          view_start=shown.index[0]))
+        def draw_price_rsi_chart():
+            st.subheader("Price & RSI chart")
+            show_figure(sbd.plot_stock_detail(ticker, data, show=False, save=False,
+                                              view_start=shown.index[0]))
 
         result = sbd.run_bubble_analysis(ticker, data)
 
@@ -238,6 +239,7 @@ with tab_one:
             st.info(result["risk_level"])
             for w in result["warnings"]:
                 st.caption(w)
+            draw_price_rsi_chart()
         else:
             v = result["verdict"]
             color = LEVEL_COLORS[v["color"]]
@@ -274,17 +276,7 @@ with tab_one:
             else:
                 st.caption("No single factor stands out against a typical stock.")
 
-            st.subheader("Was the model worried before?")
-            stamp = f"{info['trained_on']}-{info['n_training_rows']}" if info else "none"
-            hist = cached_history(ticker, str(data.index[-1].date()), len(data), stamp, data)
-            if hist is not None and len(hist) > 3:
-                hist = hist[hist.index >= shown.index[0]]
-                if len(hist) > 3:
-                    show_figure(sbd.plot_score_history(ticker, shown, hist, show=False, save=False))
-                    st.caption("Each point re-scores the stock using only data available on that date. "
-                               "Look for whether risk was already high before past drops.")
-            else:
-                st.caption("Not enough history to draw the timeline.")
+            draw_price_rsi_chart()
 
             st.subheader("What to do with this")
             strategies = sbd.generate_strategies(
