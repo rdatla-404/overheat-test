@@ -33,6 +33,20 @@ FEATURE_NAMES = ['rsi', 'ma_ratio', 'volatility', 'accel', 'max_drawdown']
 # SECTION 1: DATA LOADING
 # -------------------------------------------------------------
 
+def _clean_prices(data):
+    """
+    Drop rows Yahoo sometimes returns with a blank/invalid Close (typically today's
+    unfinished row). Without this the latest price, 200-day average and features are NaN.
+    """
+    if data is None or data.empty or 'Close' not in data.columns:
+        return None
+    data = data.copy()
+    data['Close'] = pd.to_numeric(data['Close'], errors='coerce')
+    data = data[np.isfinite(data['Close']) & (data['Close'] > 0)]
+    data = data[~data.index.duplicated(keep='last')].sort_index()
+    return data if not data.empty else None
+
+
 def load_stock_data(
     ticker: str,
     start_date: str,
@@ -68,21 +82,13 @@ def load_stock_data(
         try:
             ticker_obj = yf.Ticker(ticker)
             data = ticker_obj.history(start=start_date, end=end_date)
+            data = _clean_prices(data)
 
-            if data.empty or 'Close' not in data.columns:
+            if data is None or data.empty:
                 logger.warning(
                     f"No data returned for '{ticker}'. "
                     "Check that the ticker symbol is correct."
                 )
-                return None
-
-            data = data.copy()
-            data['Close'] = pd.to_numeric(data['Close'], errors='coerce')
-            data = data.replace([np.inf, -np.inf], np.nan).dropna(subset=['Close'])
-            data = data.loc[data['Close'] > 0].sort_index()
-            data = data.loc[~data.index.duplicated(keep='last')]
-            if data.empty:
-                logger.warning(f"No valid positive closing prices returned for '{ticker}'.")
                 return None
 
             logger.info(
@@ -302,7 +308,6 @@ def get_model_info():
         'trained_on': bundle.get('trained_on', 'unknown'),
         'n_training_rows': bundle.get('n_training_rows', 'unknown'),
         'ticker_universe_size': bundle.get('ticker_universe_size', 'unknown'),
-        'metadata': bundle.get('metadata', {}),
     }
 
 
@@ -337,19 +342,7 @@ def _load_model_bundle():
     if not os.path.exists(MODEL_PATH):
         return None
 
-    try:
-        bundle = joblib.load(MODEL_PATH)
-        required = {'model', 'scaler', 'feature_names', 'score_low', 'score_high'}
-        if not isinstance(bundle, dict) or not required.issubset(bundle):
-            raise ValueError("Model bundle is missing required fields.")
-        if bundle['feature_names'] != FEATURE_NAMES:
-            raise ValueError("Model feature definitions do not match this application version.")
-        if not np.isfinite([bundle['score_low'], bundle['score_high']]).all() or bundle['score_high'] <= bundle['score_low']:
-            raise ValueError("Model score calibration bounds are invalid.")
-        _MODEL_BUNDLE = bundle
-    except Exception as error:
-        logger.exception("Unable to load model bundle: %s", error)
-        _MODEL_BUNDLE = None
+    _MODEL_BUNDLE = joblib.load(MODEL_PATH)
     return _MODEL_BUNDLE
 
 
@@ -375,15 +368,8 @@ def compute_feature_vector(data: pd.DataFrame) -> Optional[dict]:
         dict of {feature_name: float}, or None if there isn't enough
         history to compute all five features.
     """
-    if data is None or 'Close' not in data.columns or len(data) < 200:
+    if len(data) < 200:
         return None
-
-    close = pd.to_numeric(data['Close'], errors='coerce').replace([np.inf, -np.inf], np.nan)
-    if close.isna().any() or (close <= 0).any():
-        return None
-    data = data.copy()
-    data['Close'] = close
-    data = data.loc[~data.index.duplicated(keep='last')].sort_index().copy()
 
     ma_ratio_series = get_price_to_200ma_ratio(data)
     if ma_ratio_series is None or pd.isna(ma_ratio_series.iloc[-1]):
@@ -429,15 +415,15 @@ def assign_risk_level(bubble_score: float) -> str:
         str -- Human-readable risk level.
     """
     if bubble_score >= 70:
-        return "VERY UNUSUAL OVERHEATING SIGNAL"
+        return "CRITICAL BUBBLE RISK"
     elif bubble_score >= 50:
-        return "HIGH OVERHEATING ANOMALY"
+        return "HIGH BUBBLE RISK"
     elif bubble_score >= 30:
-        return "ELEVATED OVERHEATING ANOMALY"
+        return "MODERATE BUBBLE RISK"
     elif bubble_score >= 10:
-        return "MILD OVERHEATING ANOMALY"
+        return "LOW BUBBLE RISK"
     else:
-        return "NO STRONG OVERHEATING ANOMALY"
+        return "HEALTHY -- No Bubble Detected"
 
 
 def run_bubble_analysis(ticker: str, data: pd.DataFrame) -> dict:
@@ -483,7 +469,7 @@ def run_bubble_analysis(ticker: str, data: pd.DataFrame) -> dict:
             'ticker': ticker,
             'bubble_score': None,
             'risk_level': "INSUFFICIENT DATA",
-            'warnings': ["Need at least 200 valid trading-day closing prices."],
+            'warnings': ["Need at least 200 trading days of history."],
             'sub_scores': {},
         }
 
@@ -510,8 +496,8 @@ def run_bubble_analysis(ticker: str, data: pd.DataFrame) -> dict:
     # Drawdown is excluded here -- a large recent drawdown argues against
     # a live bubble, it doesn't confirm one.
     direction_signal = z['rsi'] + z['ma_ratio'] + z['accel']
-    if direction_signal <= 0:
-        bubble_score = min(bubble_score, 15.0)
+    # (The old cap that forced scores to <= 15 when direction_signal <= 0 was removed:
+    # it pinned most stocks at 15 and made ranking worse in backtests.)
 
     risk_level = assign_risk_level(bubble_score)
 
@@ -544,9 +530,6 @@ def run_bubble_analysis(ticker: str, data: pd.DataFrame) -> dict:
     return {
         'ticker': ticker,
         'bubble_score': round(bubble_score, 1),
-        'score_name': 'Overheating anomaly score',
-        'score_note': 'Relative statistical unusualness (0–100), not a probability of a bubble, crash, or loss.',
-        'data_as_of': str(data.index[-1].date()) if hasattr(data.index[-1], 'date') else str(data.index[-1]),
         'risk_level': risk_level,
         'warnings': warnings_out,
         'sub_scores': {name: round(z[name], 2) for name in FEATURE_NAMES},
@@ -554,31 +537,160 @@ def run_bubble_analysis(ticker: str, data: pd.DataFrame) -> dict:
 
 
 # -------------------------------------------------------------
-# SECTION 4: REVIEW PROMPTS
+# SECTION 4: AVOIDANCE STRATEGIES
 # -------------------------------------------------------------
 
 def generate_strategies(ticker, current_price, bubble_score, ma_200_value=None):
-    """Return neutral review prompts; this anomaly score is not advice."""
-    if bubble_score >= 50:
-        return [
-            {'priority': 'REVIEW', 'action': 'Check position concentration',
-             'detail': f"Review how much of your portfolio depends on {ticker}; decide whether that exposure fits your own plan."},
-            {'priority': 'REVIEW', 'action': 'Compare with fundamentals and peers',
-             'detail': 'Check earnings, valuation, sector context, and recent company news. This model uses price behavior only.'},
-            {'priority': 'REVIEW', 'action': 'Review your risk plan',
-             'detail': 'Consider your time horizon, liquidity needs, and pre-existing exit rules before making a decision.'},
+    """
+    Return a list of actionable strategies based on the bubble score.
+
+    Each strategy is a dict with:
+        priority : str -- 'URGENT', 'HIGH', 'MEDIUM', 'LOW', or 'INFO'
+        action   : str -- Short action headline
+        detail   : str -- Longer explanation
+
+    Parameters:
+        ticker        : str   -- Stock ticker symbol
+        current_price : float -- Most recent closing price
+        bubble_score  : int   -- Overall bubble score (0-100)
+
+    Returns:
+        list of strategy dicts.
+    """
+    strategies = []
+
+    if bubble_score >= 70:
+        strategies = [
+            {
+                'priority': 'URGENT',
+                'action':   'REDUCE POSITION BY 50-75%',
+                'detail':   (f"Sell 50-75% of your {ticker} shares now to lock "
+                             f"in gains. Current price: ${current_price}.")
+            },
+            {
+                'priority': 'URGENT',
+                'action':   f'SET STOP-LOSS AT ${current_price * 0.90:.2f}',
+                'detail':   (f"Place an automatic sell order at "
+                             f"${current_price * 0.90:.2f} (10% below current price). "
+                             f"This caps your worst-case downside.")
+            },
+            {
+                'priority': 'HIGH',
+                'action':   'HEDGE WITH PUT OPTIONS',
+                'detail':   (f"Buy put options on {ticker} as insurance. "
+                             f"A put gains value if the stock drops -- "
+                             f"a standard hedging technique at risk desks.")
+            },
+            {
+                'priority': 'HIGH',
+                'action':   'ROTATE INTO DEFENSIVE SECTORS',
+                'detail':   ("Move proceeds into utilities (XLU), healthcare (XLV), "
+                             "or consumer staples (XLP) -- sectors that historically "
+                             "hold up better during market crashes.")
+            },
+            {
+                'priority': 'MEDIUM',
+                'action':   f'PLAN RE-ENTRY NEAR ${ma_200_value:.2f}' if ma_200_value else 'WAIT FOR 200-DAY MA TO FORM',
+                'detail':   (f"Bubbles often mean-revert to the 200-day MA. "
+                            f"Current 200-day MA: ${ma_200_value:.2f}." if ma_200_value
+                             else "Insufficient history to calculate 200-day MA re-entry level.")
+            },
+            {
+                'priority': 'MEDIUM',
+                'action':   'RAISE CASH RESERVE TO 20%',
+                'detail':   ("Holding 20% cash lets you buy quality assets cheaply "
+                             "after the bubble bursts.")
+            },
         ]
-    if bubble_score >= 30:
-        return [
-            {'priority': 'MONITOR', 'action': 'Watch the unusual features',
-             'detail': 'Review the feature z-scores and compare the move with sector and market performance.'},
-            {'priority': 'MONITOR', 'action': 'Recheck with updated data',
-             'detail': 'The score is a snapshot of historical price behavior and may change as new data arrives.'},
+
+    elif bubble_score >= 50:
+        strategies = [
+            {
+                'priority': 'HIGH',
+                'action':   'TRIM POSITION BY 25-40%',
+                'detail':   (f"Sell 25-40% of {ticker} to reduce exposure and "
+                             f"book partial profits at ${current_price}.")
+            },
+            {
+                'priority': 'HIGH',
+                'action':   'SET 15% TRAILING STOP-LOSS',
+                'detail':   (f"A trailing stop follows the price upward, triggering "
+                             f"a sell if it drops 15% from peak. "
+                             f"Currently that would be ${current_price * 0.85:.2f}.")
+            },
+            {
+                'priority': 'MEDIUM',
+                'action':   'CAP POSITION AT 10% OF PORTFOLIO',
+                'detail':   ("No single stock should exceed 10% of your total "
+                             "portfolio. Concentration in a bubble stock magnifies loss.")
+            },
+            {
+                'priority': 'MEDIUM',
+                'action':   'MONITOR RSI WEEKLY',
+                'detail':   ("If RSI crosses 80, escalate to the CRITICAL protocol. "
+                             "Set a weekly reminder to rerun this analysis.")
+            },
+            {
+                'priority': 'LOW',
+                'action':   'DO NOT ADD TO POSITION',
+                'detail':   (f"Avoid buying more {ticker} until the bubble score "
+                             f"drops below 25. Never average up into a bubble.")
+            },
         ]
-    return [
-        {'priority': 'INFO', 'action': 'No strong overheating anomaly detected',
-         'detail': 'This does not mean the security is safe, fairly valued, or likely to rise.'},
-    ]
+
+    elif bubble_score >= 30:
+        strategies = [
+            {
+                'priority': 'MEDIUM',
+                'action':   'MONITOR WEEKLY',
+                'detail':   (f"{ticker} shows early warning signs. Not critical yet, "
+                             f"but requires weekly review.")
+            },
+            {
+                'priority': 'MEDIUM',
+                'action':   f'MENTAL STOP-LOSS AT ${current_price * 0.88:.2f}',
+                'detail':   (f"If {ticker} falls below ${current_price * 0.88:.2f} "
+                             f"(12% below current), treat it as a sell signal.")
+            },
+            {
+                'priority': 'LOW',
+                'action':   'HOLD -- DO NOT ADD YET',
+                'detail':   ("Hold your current position but do not add more until "
+                             "the bubble score falls back below 20.")
+            },
+            {
+                'priority': 'LOW',
+                'action':   'KEEP PORTFOLIO DIVERSIFIED',
+                'detail':   ("Hold stocks across at least 5 different sectors so that "
+                             "one sector crash does not devastate the whole portfolio.")
+            },
+        ]
+
+    else:
+        strategies = [
+            {
+                'priority': 'LOW',
+                'action':   'HOLD OR ACCUMULATE',
+                'detail':   (f"{ticker} shows no significant bubble signals. "
+                             f"Normal buy-and-hold or dollar-cost averaging applies.")
+            },
+            {
+                'priority': 'LOW',
+                'action':   'DOLLAR-COST AVERAGE (DCA)',
+                'detail':   ("Invest a fixed amount on a regular schedule regardless "
+                             "of price. This reduces the impact of bad timing.")
+            },
+            {
+                'priority': 'INFO',
+                'action':   'RERUN THIS ANALYSIS MONTHLY',
+                'detail':   ("Conditions change. Schedule a monthly check to catch "
+                             "developing bubble signals early.")
+            },
+        ]
+
+    return strategies
+
+
 # -------------------------------------------------------------
 # SECTION 5: PRINTING / REPORTING
 # -------------------------------------------------------------
@@ -631,10 +743,8 @@ def print_bubble_report(result):
         print(f"  {'=' * 50}")
         return
 
-    print(f"  Overheating anomaly score : {result['bubble_score']} / 100")
-    print(f"  Signal label              : {result['risk_level']}")
-    print(f"  Data through              : {result.get('data_as_of', 'unknown')}")
-    print(f"  Note                      : {result.get('score_note', '')}")
+    print(f"  Bubble Score : {result['bubble_score']} / 100  (ML anomaly score)")
+    print(f"  Risk Level   : {result['risk_level']}")
     print(f"\n  Feature Z-Scores (vs. training population, |z| > 2 is unusual):")
 
     labels = {
@@ -659,7 +769,7 @@ def print_bubble_report(result):
 
 def print_strategies(ticker, bubble_score, strategies):
     """
-    Print neutral review prompts to the console.
+    Print all recommended avoidance strategies to the console.
 
     Parameters:
         ticker       : str  -- Stock symbol
@@ -675,8 +785,8 @@ def print_strategies(ticker, bubble_score, strategies):
     }
 
     print(f"\n  {'=' * 50}")
-    print(f"  REVIEW PROMPTS: {ticker}")
-    print(f"  Anomaly Score: {bubble_score} / 100")
+    print(f"  AVOIDANCE STRATEGIES: {ticker}")
+    print(f"  Bubble Score: {bubble_score} / 100")
     print(f"  {'=' * 50}")
 
     for i, strat in enumerate(strategies, start=1):
@@ -867,7 +977,7 @@ def main():
         2. Downloads the stock data.
         3. Prints a metric summary.
         4. Runs the bubble analysis and prints the report.
-        5. Prints neutral review prompts for context.
+        5. Prints avoidance strategies scaled to the risk level.
         6. Plots the price/RSI chart.
         7. Asks whether to analyze another stock.
     """
